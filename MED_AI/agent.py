@@ -2,65 +2,66 @@
 LangGraph agent – medical report analyser
 =========================================
 Graph flow:
-    extract_info → web_search → synthesise → END
+    input_guard → extract_info → web_search → synthesise → output_guard → END
+
+LLM    : Anthropic Claude  (claude-sonnet-4-5)
+Search : Tavily            (key from .env)
+Guards : guardrails.py
 """
 
 from __future__ import annotations
 
 import json
+import os
 from typing import TypedDict, Annotated
 import operator
 
-from langchain_openai import ChatOpenAI
+import dotenv
 from langchain_anthropic import ChatAnthropic
-
-from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
-import os
-import dotenv
+from tavily import TavilyClient
+
+from guardrails import run_input_guardrails, run_output_guardrails
 
 dotenv.load_dotenv()
 
-from guardrails import run_input_guardrails, run_output_guardrails
-# ── State ─────────────────────────────────────────────────────────────────────
 
-class AgentState(TypedDict):
-    raw_text: str                          # original OCR / file text
-    extracted_info: dict                   # structured patient info
-    search_results: Annotated[list, operator.add]  # web search hits
-    final_summary: str                     # output paragraph
-
-
-# ── LLM + tool ────────────────────────────────────────────────────────────────
+# ── LLM + search client ───────────────────────────────────────────────────────
 
 llm = ChatAnthropic(
     model="claude-sonnet-4-5",
     temperature=0.3,
     max_tokens=2048,
 )
-# To install: pip install tavily-python
-from tavily import TavilyClient
+
 client = TavilyClient(os.getenv("TAVILY_API_KEY"))
-    
 
-#search_tool = TavilySearchResults(max_results=4)
 
-print(os.getenv("ANTHROPIC_API_KEY"))
+# ── State ─────────────────────────────────────────────────────────────────────
+
+class AgentState(TypedDict):
+    raw_text: str                                   
+    extracted_info: dict                            
+    search_results: Annotated[list, operator.add]   
+    final_summary: str                              
+    warnings: Annotated[list, operator.add]         #addition
+
 
 # ── Node 0 – input guardrails ─────────────────────────────────────────────────
- 
+
 def input_guard(state: AgentState) -> dict:
     """
     Runs before extraction:
       • Classifies document as medical or not
       • Redacts PII (phones, emails, Aadhaar, PAN)
-    Returns cleaned text + any warnings. Pipeline always continues.
+    Pipeline always continues regardless of result.
     """
     cleaned_text, warns = run_input_guardrails(state["raw_text"])
     return {"raw_text": cleaned_text, "warnings": warns}
- 
-# ── Node 1 – extract structured patient info from raw text ───────────────────
+
+
+# ── Node 1 – extract structured patient info ──────────────────────────────────
 
 def extract_info(state: AgentState) -> dict:
     system = SystemMessage(content="""You are a medical document parser.
@@ -74,11 +75,12 @@ Return a JSON object (no markdown) with these keys (use null if not found):
     response = llm.invoke([system, human])
     text = response.content.strip()
 
-    # strip accidental markdown fences
+    # Strip accidental markdown fences
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.startswith("json"):
             text = text[4:]
+    text = text.strip()
 
     try:
         info = json.loads(text)
@@ -92,24 +94,25 @@ Return a JSON object (no markdown) with these keys (use null if not found):
 
 def web_search(state: AgentState) -> dict:
     info = state["extracted_info"]
-    response = client.search(
-    query=state["extracted_info"].get("impression", "") or state["extracted_info"].get("findings", "") or "",
-    search_depth="advanced"
+
+    query = (
+        info.get("impression") or
+        info.get("findings") or
+        info.get("raw_extraction") or
+        "USG abdominal report findings explained"
     )
 
-    results = []
+    response = client.search(
+        query=str(query)[:300],   # cap query length
+        search_depth="advanced"
+    )
 
-    # Tavily returns results in 'results' key
-    for r in response.get("results", [])[:3]:  # limit to 3
-        results.append({
-            "content": r.get("content", "")
-        })
+    results = [
+        {"content": r.get("content", "")}
+        for r in response.get("results", [])[:3]
+    ]
 
-    return {
-        "search_results": results
-    }
-
-    
+    return {"search_results": results}
 
 
 # ── Node 3 – synthesise final paragraph ──────────────────────────────────────
@@ -142,55 +145,55 @@ Web research context:
     response = llm.invoke([system, human])
     return {"final_summary": response.content.strip()}
 
+
 # ── Node 4 – output guardrails ────────────────────────────────────────────────
- 
+
 def output_guard(state: AgentState) -> dict:
     """
     Runs after synthesis:
       • Flags harmful / dangerous medical advice
       • Ensures disclaimer is present
-      • Trims summary if too long (anti-hallucination sprawl)
-    Returns (possibly modified) summary + any new warnings.
+      • Trims summary if too long
+    Pipeline always continues regardless of result.
     """
     final, warns = run_output_guardrails(state["final_summary"])
     return {"final_summary": final, "warnings": warns}
 
-# ── Build the graph ───────────────────────────────────────────────────────────
 
-def build_graph() -> StateGraph:
+# ── Build and compile the graph ───────────────────────────────────────────────
+
+def build_graph():
     g = StateGraph(AgentState)
 
+    g.add_node("input_guard",  input_guard)
     g.add_node("extract_info", extract_info)
-    g.add_node("web_search", web_search)
-    g.add_node("synthesise", synthesise)
+    g.add_node("web_search",   web_search)
+    g.add_node("synthesise",   synthesise)
+    g.add_node("output_guard", output_guard)
 
-    g.set_entry_point("extract_info")
+    g.set_entry_point("input_guard")
+    g.add_edge("input_guard",  "extract_info")
     g.add_edge("extract_info", "web_search")
-    g.add_edge("web_search", "synthesise")
-    g.add_edge("synthesise", END)
+    g.add_edge("web_search",   "synthesise")
+    g.add_edge("synthesise",   "output_guard")
+    g.add_edge("output_guard", END)
 
     return g.compile()
 
 
 _graph = build_graph()
 
-#print(_graph.visualize())  # for debugging – view the graph structure in the console
-# ── Public entry-point ────────────────────────────────────────────────────────
-raw_text = """The liver is normal in size and contour, 
-                demonstrating a homogeneous echotexture without evidence of focal 
-                masses or intrahepatic biliary ductal dilation. The gallbladder is well-distended 
-                with a thin, smooth wall; no gallstones, sludge, or pericholecystic fluid are 
-                visualized. The common bile duct (CBD) is within normal limits, measuring 4 mm 
-                in diameter. The pancreas is partially obscured by overlying bowel gas, 
-                but the visualized head and body appear unremarkable. Both kidneys are normal in 
-                size and position, showing maintained corticomedullary differentiation without 
-                signs of hydronephrosis or renal calculi. The spleen is of normal size and 
-                echogenicity. No free fluid (ascites) or enlarged lymph nodes are identified 
-                within the visualized abdominal cavity. The abdominal aorta is of normal caliber 
-                throughout its visualized course."""
-def run_agent(raw_text: str) -> str:
-    """Run the full LangGraph pipeline and return the final summary."""
-    result = _graph.invoke({"raw_text": raw_text, "search_results": []})
-    return(result["final_summary"])
 
-#run_agent(raw_text)
+
+
+def run_agent(raw_text: str) -> tuple[str, list[str]]:
+    """
+    Run the full LangGraph pipeline.
+    Returns (final_summary, warnings).
+    """
+    result = _graph.invoke({
+        "raw_text": raw_text,
+        "search_results": [],
+        "warnings": [],
+    })
+    return result["final_summary"], result.get("warnings", [])

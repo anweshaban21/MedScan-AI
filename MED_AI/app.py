@@ -149,15 +149,16 @@ if uploaded_file:
                     st.text(raw_text[:1500] + ("…" if len(raw_text) > 1500 else ""))
 
                 with st.spinner("Agent is thinking…"):
-                    result = run_agent(raw_text)
+                    summary, warnings = run_agent(raw_text)
+                    summary.replace("\n", "<br>")
 
                 st.markdown('<div class="result-card"><h4>🩺 Patient Summary</h4>' +
-                            result.replace("\n", "<br>") + "</div>",
+                            summary + "</div>",
                             unsafe_allow_html=True)
 
                 st.download_button(
                     "⬇️ Download Summary",
-                    data=result,
+                    data=summary,
                     file_name="patient_summary.txt",
                     mime="text/plain",
                 )
